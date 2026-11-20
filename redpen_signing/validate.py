@@ -1,0 +1,529 @@
+"""Full schema-6 and registry-tree validation owned by the pinned signer.
+
+The registry repository is untrusted input from the signer's point of view.
+This module therefore validates the schema, the tree, file digests, mirrored
+manifest fields, registry ids, and release metadata without importing any code
+from the registry checkout.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional, Union
+
+try:
+    from jsonschema import Draft202012Validator, FormatChecker
+except ImportError:  # pragma: no cover - exercised by the CLI error path
+    Draft202012Validator = None  # type: ignore[assignment]
+    FormatChecker = None  # type: ignore[assignment]
+
+from .canonical import CanonicalError, check_canonical_bytes, load_json, sha256_file
+from .registry import (
+    CLOCK_SKEW,
+    MAX_EXPIRES_DAYS,
+    RESERVED_REGISTRY_IDS,
+    TIER_REGISTRY_IDS,
+    RegistryError,
+    assert_registry_shape,
+    parse_timestamp,
+    registry_identity,
+    safe_relative_path,
+)
+from .verify import SignatureError, verify_registry
+
+PathLike = Union[str, "os.PathLike[str]"]
+SCHEMA_DIR = Path(__file__).resolve().parent / "schemas"
+VERSION_LINE = re.compile(r"^-\s+\*\*Version:\*\*\s+(\S+)\s*$", re.MULTILINE)
+ADAPTER_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+MIRRORED_FIELDS = (
+    "name",
+    "description",
+    "author",
+    "icon",
+    "homepage",
+    "extensions",
+    "appliesTo",
+    "permissions",
+    "registry",
+    "runtimes",
+)
+ADAPTER_METADATA_DIRS = {
+    ".git",
+    ".github",
+    ".vscode",
+    "docs",
+    "keys",
+    "schemas",
+    "scripts",
+    "tests",
+}
+
+
+def load_schema(name: str) -> dict[str, Any]:
+    path = SCHEMA_DIR / name
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RegistryError(f"cannot load signer schema {path.name}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RegistryError(f"signer schema {path.name} must be an object")
+    return value
+
+
+def schema_errors(instance: Any, schema: dict, label: str) -> list[str]:
+    if Draft202012Validator is None:
+        return ["jsonschema is not installed; install the pinned signer requirements"]
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    errors = []
+    for error in sorted(
+        validator.iter_errors(instance),
+        key=lambda item: tuple(str(part) for part in item.path),
+    ):
+        location = "/".join(str(part) for part in error.absolute_path) or "(root)"
+        errors.append(f"{label} at {location}: {error.message}")
+    return errors
+
+
+def _load_canonical(path: Path) -> Any:
+    return check_canonical_bytes(path.read_bytes(), str(path))
+
+
+def _settings(manifest: dict) -> dict[str, dict]:
+    fields = manifest.get("settings")
+    if not isinstance(fields, list):
+        return {}
+    return {
+        field.get("key"): field
+        for field in fields
+        if isinstance(field, dict) and isinstance(field.get("key"), str)
+    }
+
+
+def _entry_errors(
+    root: Path,
+    entry: dict[str, Any],
+    manifest_schema: dict,
+    readme_base: str,
+) -> list[str]:
+    errors: list[str] = []
+    adapter_id = entry.get("id")
+    label = f"adapter {adapter_id!r}"
+    folder_name = entry.get("folder")
+    if folder_name != adapter_id:
+        errors.append(f"{label}: folder must equal id")
+    if not isinstance(folder_name, str) or not ADAPTER_ID.fullmatch(folder_name):
+        errors.append(f"{label}: invalid folder {folder_name!r}")
+        return errors
+    folder = root / folder_name
+    if not folder.is_dir():
+        errors.append(f"{label}: missing folder")
+        return errors
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.is_file():
+        errors.append(f"{label}: missing manifest.json")
+        return errors
+    try:
+        manifest = load_json(manifest_path)
+    except RegistryError as exc:
+        errors.append(str(exc))
+        return errors
+    if not isinstance(manifest, dict):
+        errors.append(f"{label}: manifest.json must be an object")
+        return errors
+    errors.extend(schema_errors(manifest, manifest_schema, f"{label}/manifest.json"))
+    if manifest.get("id") != adapter_id:
+        errors.append(f"{label}: manifest id does not match")
+    if manifest.get("version") != entry.get("version"):
+        errors.append(f"{label}: manifest version does not match registry version")
+    for field in MIRRORED_FIELDS:
+        if manifest.get(field) != entry.get(field):
+            errors.append(f"{label}: manifest {field} does not match registry")
+
+    files = entry.get("files")
+    if not isinstance(files, list) or not files:
+        errors.append(f"{label}: files must be a non-empty array")
+        return errors
+    seen: set[str] = set()
+    for declared in files:
+        if not isinstance(declared, dict):
+            errors.append(f"{label}: every file must be an object")
+            continue
+        name = declared.get("path")
+        digest = declared.get("sha256")
+        if not safe_relative_path(name):
+            errors.append(f"{label}: unsafe file path {name!r}")
+            continue
+        if name in seen:
+            errors.append(f"{label}: duplicate file {name!r}")
+        seen.add(name)
+        path = folder / name
+        if not path.is_file():
+            errors.append(f"{label}: missing file {name!r}")
+            continue
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            errors.append(f"{label}: sha256 mismatch for {name!r}")
+    for required in ("manifest.json", "adapter.lua"):
+        if required not in seen:
+            errors.append(f"{label}: files must include {required!r}")
+    if not (folder / "adapter.lua").is_file():
+        errors.append(f"{label}: missing adapter.lua")
+
+    readme = folder / "README.md"
+    if not readme.is_file():
+        errors.append(f"{label}: missing README.md")
+    else:
+        match = VERSION_LINE.search(readme.read_text(encoding="utf-8"))
+        if not match:
+            errors.append(f"{label}: README.md needs a Version line")
+        elif match.group(1) != manifest.get("version"):
+            errors.append(f"{label}: README.md version does not match manifest")
+    expected_readme = f"{readme_base}/{adapter_id}/README.md"
+    if entry.get("readmeUrl") != expected_readme:
+        errors.append(f"{label}: readmeUrl does not match {expected_readme!r}")
+
+    settings = _settings(manifest)
+    runtimes = manifest.get("runtimes")
+    for runtime in runtimes if isinstance(runtimes, list) else []:
+        if not isinstance(runtime, dict):
+            continue
+        setting = runtime.get("setting")
+        if setting and setting not in settings:
+            errors.append(f"{label}: runtime setting {setting!r} is not a settings field")
+        default = (settings.get(setting) or {}).get("default") if setting else None
+        version = runtime.get("version")
+        if version is not None and default is not None and str(version) != str(default):
+            errors.append(f"{label}: runtime version must equal the setting default")
+        packages = runtime.get("packages") or {}
+        if isinstance(packages, dict):
+            package_setting = packages.get("setting")
+            if package_setting and package_setting not in settings:
+                errors.append(
+                    f"{label}: package setting {package_setting!r} is not a settings field"
+                )
+    return errors
+
+
+def _release_errors(
+    root: Path,
+    registry: dict[str, Any],
+    config: dict[str, Any],
+) -> list[str]:
+    release_path = root / "release.json"
+    if not release_path.is_file():
+        return []
+    errors: list[str] = []
+    try:
+        release = load_json(release_path)
+    except RegistryError as exc:
+        return [str(exc)]
+    if not isinstance(release, dict):
+        return ["release.json must be an object"]
+    registry_id, sequence = registry_identity(registry)
+    expected = {
+        "registryId": registry_id,
+        "sequence": sequence,
+        "tag": f"registry-v{sequence}",
+        "tier": config.get("tier"),
+        "signerCommit": (config.get("signing") or {}).get("signerCommit"),
+        "issuedAt": registry.get("issuedAt"),
+        "expiresAt": registry.get("expiresAt"),
+    }
+    for field, value in expected.items():
+        if release.get(field) != value:
+            errors.append(f"release.json {field} does not match the registry/config")
+    if release.get("registrySha256") != sha256_file(root / "registry.json"):
+        errors.append("release.json registrySha256 does not match registry.json")
+    signature = root / "registry.json.minisig"
+    if not signature.is_file():
+        errors.append("release.json exists but registry.json.minisig is missing")
+    elif release.get("signatureSha256") != sha256_file(signature):
+        errors.append("release.json signatureSha256 does not match the signature")
+    if not re.fullmatch(r"[0-9A-F]{16}", str(release.get("keyId", ""))):
+        errors.append("release.json keyId is not an uppercase 16-character hex key id")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(release.get("publicKeyFingerprint", ""))):
+        errors.append("release.json publicKeyFingerprint is not a SHA-256 digest")
+    key_file = (config.get("signing") or {}).get("keyFile")
+    if key_file:
+        key_path = root / key_file
+        if not key_path.is_file():
+            errors.append("release.json signing.keyFile is missing")
+        else:
+            from .keys import read_public_key
+
+            key = read_public_key(key_path)
+            if release.get("keyId") != key.key_id:
+                errors.append("release.json keyId does not match signing.keyFile")
+            if release.get("publicKeyFingerprint") != key.fingerprint:
+                errors.append(
+                    "release.json publicKeyFingerprint does not match signing.keyFile"
+                )
+    return errors
+
+
+def validate_registry_tree(
+    root: PathLike,
+    *,
+    registry_path: Optional[PathLike] = None,
+    config_path: Optional[PathLike] = None,
+    require_signature: bool = False,
+    verify_present: bool = False,
+    allow_expired: bool = False,
+    skip_release: bool = False,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    base = Path(root).resolve()
+    registry_file = Path(registry_path) if registry_path else base / "registry.json"
+    config_file = Path(config_path) if config_path else base / "registry.config.json"
+    if not registry_file.is_absolute():
+        registry_file = base / registry_file
+    if not config_file.is_absolute():
+        config_file = base / config_file
+    errors: list[str] = []
+
+    try:
+        registry = _load_canonical(registry_file)
+        config = _load_canonical(config_file)
+    except (RegistryError, CanonicalError, OSError) as exc:
+        return {"valid": False, "errors": [str(exc)]}
+    if not isinstance(registry, dict) or not isinstance(config, dict):
+        return {
+            "valid": False,
+            "errors": ["registry.json and registry.config.json must be objects"],
+        }
+
+    registry_schema = load_schema("registry.schema.json")
+    manifest_schema = load_schema("manifest.schema.json")
+    config_schema = load_schema("registry.config.schema.json")
+    errors.extend(schema_errors(config, config_schema, "registry.config.json"))
+    errors.extend(schema_errors(registry, registry_schema, "registry.json"))
+
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    try:
+        registry_id, sequence = assert_registry_shape(
+            registry,
+            config=config,
+            require_fresh=not allow_expired,
+            now=current,
+        )
+    except RegistryError as exc:
+        errors.append(str(exc))
+        registry_id, sequence = "", 0
+
+    if config.get("publisher") != registry.get("publisher"):
+        errors.append("registry.config.json publisher does not match registry.json")
+    expected_base = f"https://raw.githubusercontent.com/{config.get('repository')}/main"
+    if config.get("readmeBaseUrl") != expected_base:
+        errors.append(
+            f"readmeBaseUrl must be {expected_base!r} (no trailing slash)"
+        )
+    if config.get("tier") == "third-party" and registry.get("registryId") in RESERVED_REGISTRY_IDS:
+        errors.append("third-party registries may not use a reserved registryId")
+
+    signing = config.get("signing") or {}
+    signer_repository = signing.get("signerRepository")
+    if signer_repository == config.get("repository"):
+        errors.append("signing.signerRepository must be a separate repository")
+    if config.get("tier") in TIER_REGISTRY_IDS:
+        if signer_repository != "eslam-allam/red-pen-registry-signing":
+            errors.append(
+                f"{config.get('tier')} registries must use the expected signer repository"
+            )
+        expected_environment = f"registry-signing-{config.get('tier')}"
+        if signing.get("environment") != expected_environment:
+            errors.append(
+                f"{config.get('tier')} registries must use environment "
+                f"{expected_environment!r}"
+            )
+    if signing.get("enabled"):
+        key_file = signing.get("keyFile")
+        if not isinstance(key_file, str) or not key_file:
+            errors.append("signing.enabled requires signing.keyFile")
+        else:
+            key_path = base / key_file
+            if not key_path.is_file():
+                errors.append(f"signing.keyFile is missing: {key_file}")
+            else:
+                from .keys import read_public_key
+
+                try:
+                    read_public_key(key_path)
+                except Exception as exc:
+                    errors.append(f"signing.keyFile is invalid: {exc}")
+
+    adapters = registry.get("adapters") if isinstance(registry.get("adapters"), list) else []
+    ids = [entry.get("id") for entry in adapters if isinstance(entry, dict)]
+    if len(ids) != len(set(ids)):
+        errors.append("registry has duplicate adapter ids")
+    discovered = {
+        child.name
+        for child in base.iterdir()
+        if child.is_dir()
+        and child.name not in ADAPTER_METADATA_DIRS
+        and (child / "manifest.json").is_file()
+    }
+    registered = {
+        entry.get("folder") for entry in adapters if isinstance(entry, dict)
+    }
+    for missing in sorted(discovered - registered):
+        errors.append(f"adapter folder {missing!r} is missing from registry.json")
+    for extra in sorted(item for item in registered - discovered if item):
+        errors.append(f"registry entry {extra!r} has no adapter folder")
+    for entry in adapters:
+        if isinstance(entry, dict):
+            errors.extend(
+                _entry_errors(
+                    base,
+                    entry,
+                    manifest_schema,
+                    str(config.get("readmeBaseUrl")),
+                )
+            )
+
+    signature_path = base / "registry.json.minisig"
+    key_file = (config.get("signing") or {}).get("keyFile")
+    key_path = base / key_file if key_file else None
+    if require_signature or (verify_present and signature_path.is_file()):
+        if key_path is None or not key_path.is_file():
+            errors.append("a signature is required but signing.keyFile is missing")
+        elif not signature_path.is_file():
+            errors.append("registry.json.minisig is required but missing")
+        else:
+            try:
+                verify_registry(
+                    registry_file,
+                    signature_path,
+                    key_path,
+                    expected_registry_id=registry_id or None,
+                    expected_sequence=sequence or None,
+                    require_fresh=not allow_expired,
+                )
+            except (SignatureError, RegistryError, OSError) as exc:
+                errors.append(f"signature: {exc}")
+
+    if not skip_release:
+        errors.extend(_release_errors(base, registry, config))
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "registryId": registry.get("registryId"),
+        "sequence": registry.get("sequence"),
+        "adapters": len(adapters),
+    }
+
+
+def ci_config(config: dict[str, Any]) -> dict[str, str]:
+    registry_id = config.get("registryId")
+    if not isinstance(registry_id, str):
+        raise RegistryError("registry.config.json: invalid registryId")
+    tier = config.get("tier")
+    expected_id = TIER_REGISTRY_IDS.get(tier)
+    if expected_id is not None and registry_id != expected_id:
+        raise RegistryError(f"{tier} registries must use registryId {expected_id!r}")
+    if tier == "third-party" and registry_id in RESERVED_REGISTRY_IDS:
+        raise RegistryError("third-party registries may not use a reserved registryId")
+    signing = config.get("signing") or {}
+    if tier in TIER_REGISTRY_IDS:
+        expected_environment = f"registry-signing-{tier}"
+        if signing.get("environment") != expected_environment:
+            raise RegistryError(
+                f"{tier} registries must use environment {expected_environment!r}"
+            )
+    return {
+        "enabled": "true" if signing.get("enabled") else "false",
+        "tier": str(tier or ""),
+        "environment": str(signing.get("environment") or ""),
+        "registry_id": registry_id,
+        "key_file": str(signing.get("keyFile") or ""),
+        "signer_repository": str(signing.get("signerRepository") or ""),
+        "signer_commit": str(signing.get("signerCommit") or ""),
+        "require_signature": "true" if config.get("requireSignature") else "false",
+        "expires_days": str(signing.get("expiresInDays") or ""),
+    }
+
+
+def _normalize_repository(value: str) -> str:
+    normalized = value.strip()
+    match = re.search(r"github\.com[:/]+([^/]+/[^/]+?)(?:\.git)?$", normalized)
+    if match:
+        return match.group(1)
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized.strip("/")
+
+
+def check_pin(
+    repo_dir: PathLike,
+    commit: str,
+    *,
+    expected_repository: Optional[str] = None,
+    remote: str = "origin",
+    branch: str = "main",
+) -> None:
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RegistryError("signer commit must be a full 40-character SHA")
+    root = Path(repo_dir)
+    if not (root / ".git").exists():
+        raise RegistryError(f"{root} is not a git checkout")
+    remote_url = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", remote],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if remote_url.returncode != 0:
+        raise RegistryError(f"signer checkout has no {remote!r} remote")
+    actual_repository = _normalize_repository(remote_url.stdout)
+    if expected_repository is not None:
+        expected = _normalize_repository(expected_repository)
+        if actual_repository != expected:
+            raise RegistryError(
+                f"signer checkout is {actual_repository!r}, expected {expected!r}"
+            )
+    shallow = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--is-shallow-repository"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if shallow.stdout.strip() == "true":
+        unshallow = subprocess.run(
+            ["git", "-C", str(root), "fetch", "--unshallow", "--quiet", remote],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if unshallow.returncode != 0:
+            raise RegistryError("could not unshallow the signer repository")
+    fetch = subprocess.run(
+        ["git", "-C", str(root), "fetch", "--quiet", remote, branch],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if fetch.returncode != 0:
+        raise RegistryError("could not fetch the signer repository main branch")
+    ancestor = subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", commit, "FETCH_HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if ancestor.returncode != 0:
+        raise RegistryError(
+            f"signer commit {commit} is not reachable from {remote}/{branch}; "
+            "bump the pin to a merged signer commit"
+        )
