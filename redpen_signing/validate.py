@@ -105,6 +105,22 @@ def _settings(manifest: dict) -> dict[str, dict]:
     }
 
 
+def _bootstrap_errors(manifest: dict, label: str) -> list[str]:
+    runtimes = manifest.get("runtimes")
+    runtimes = runtimes if isinstance(runtimes, list) else []
+    bootstrap = manifest.get("bootstrap")
+    errors = []
+    if runtimes and not (
+        isinstance(bootstrap, dict)
+        and isinstance(bootstrap.get("mise"), str)
+        and bootstrap["mise"].strip()
+    ):
+        errors.append(f"{label}: managed runtimes need a non-empty bootstrap.mise")
+    if not runtimes and bootstrap:
+        errors.append(f"{label}: bootstrap is declared without a managed runtime")
+    return errors
+
+
 def _entry_errors(
     root: Path,
     entry: dict[str, Any],
@@ -206,6 +222,7 @@ def _entry_errors(
                 errors.append(
                     f"{label}: package setting {package_setting!r} is not a settings field"
                 )
+    errors.extend(_bootstrap_errors(manifest, label))
     return errors
 
 
