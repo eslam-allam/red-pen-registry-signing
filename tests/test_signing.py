@@ -69,16 +69,16 @@ def make_config(registry_id: str = "test-registry") -> dict:
 def make_registry(sequence: int = 1, registry_id: str = "test-registry") -> dict:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     return {
-        "schema": 6,
+        "schema": 7,
         "kind": "red-pen-adapters",
         "registryId": registry_id,
-        "name": "Test registry",
         "publisher": "Red Pen tests",
         "sequence": sequence,
         "issuedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "expiresAt": (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "adapters": [
             {
+                "apiVersion": 2,
                 "id": "demo",
                 "folder": "demo",
                 "files": [{"path": "manifest.json", "sha256": "0" * 64}],
@@ -273,6 +273,47 @@ class RegistryTests(unittest.TestCase):
         registry["adapters"].append(dict(registry["adapters"][0]))
         with self.assertRaises(RegistryError):
             assert_registry_shape(registry)
+
+    def test_schema_6_registry_rejected(self) -> None:
+        registry = make_registry()
+        registry["schema"] = 6
+        with self.assertRaises(RegistryError) as caught:
+            assert_registry_shape(registry)
+        self.assertIn("schema must be 7", str(caught.exception))
+
+    def test_root_name_rejected(self) -> None:
+        registry = make_registry()
+        registry["name"] = "Test registry"
+        with self.assertRaises(RegistryError) as caught:
+            assert_registry_shape(registry)
+        self.assertIn("root name", str(caught.exception))
+
+    def test_entry_api_version_required(self) -> None:
+        registry = make_registry()
+        registry["adapters"][0].pop("apiVersion")
+        with self.assertRaises(RegistryError) as caught:
+            assert_registry_shape(registry)
+        self.assertIn("apiVersion must be 2", str(caught.exception))
+
+    def test_entry_api_version_one_rejected(self) -> None:
+        registry = make_registry()
+        registry["adapters"][0]["apiVersion"] = 1
+        with self.assertRaises(RegistryError):
+            assert_registry_shape(registry)
+
+    def test_files_must_be_objects_for_signing(self) -> None:
+        registry = make_registry()
+        registry["adapters"][0]["files"] = ["manifest.json"]
+        with self.assertRaises(RegistryError) as caught:
+            assert_registry_shape(registry)
+        self.assertIn("every file must be an object", str(caught.exception))
+
+    def test_files_need_hashes_for_signing(self) -> None:
+        registry = make_registry()
+        registry["adapters"][0]["files"] = [{"path": "manifest.json"}]
+        with self.assertRaises(RegistryError) as caught:
+            assert_registry_shape(registry)
+        self.assertIn("lowercase sha256", str(caught.exception))
 
     def test_trusted_comment_roundtrip(self) -> None:
         self.assertEqual(

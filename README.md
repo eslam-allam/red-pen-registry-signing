@@ -15,11 +15,23 @@ code that sees `MINISIGN_SECRET_KEY_B64` and `MINISIGN_PASSWORD`.
 
 ## What it does
 
-- validates `kind: "red-pen-adapters"`, schema 6, and lowercase slug registry
-  ids (official `red-pen-official`, community `red-pen-community`);
-- validates entry-level `bootstrap` pins (`mise`/`uv`): only `latest` or a
-  full SemVer 2.0.0 pin is accepted, managed runtimes require `mise`, and the
-  entry must match the manifest;
+- validates `kind: "red-pen-adapters"`, registry schema 7, manifest schema 5,
+  entry/manifest `apiVersion: 2`, and lowercase slug registry ids (official
+  `red-pen-official`, community `red-pen-community`);
+- validates every entry against the generated registry schema, so legacy
+  permissions (`environment`, `files:read`, `files:write`, `directories`) and
+  extra legacy fields such as a root or entry `environment` are rejected;
+- rejects a root `name`; adapter names belong on the entries;
+- requires object `files` entries with a lowercase `sha256` (the generated
+  schema keeps `sha256` optional for unsigned third-party registries, but this
+  signer is used for the signed official/community registries);
+- compares every mirrored field listed in the generated `mirror-fields.json`
+  (`settings`, `keyInput`, `questionInput`, `output`, `directories`,
+  `directoryPicker`, and the older fields) instead of a hardcoded tuple;
+- validates entry-level `bootstrap` pins (`mise`/`uv`) against the generated
+  contract (`latest`, or the pinned enum values `2026.11.11` for `mise` and
+  `0.13.9` for `uv`), managed runtimes require `mise`, and the entry must match
+  the manifest;
 - writes deterministic registry bytes (sorted keys, two-space indent, LF, one
   trailing newline);
 - bumps `sequence`, sets `issuedAt` and `expiresAt`;
@@ -59,10 +71,54 @@ python -m redpen_signing.cli test-key --registry registry.json --config registry
 `--password-env`). `install-secret-key` reads base64 from
 `MINISIGN_SECRET_KEY_B64`, writes mode `0600`, and never prints the value.
 
+## Schema contract
+
+The files in `redpen_signing/schemas/` are copied from the Red Pen app's
+generated contract artifacts, not maintained by hand:
+
+| Signer file | App source path |
+| --- | --- |
+| `manifest.schema.json` | `schemas/manifest.schema.json` |
+| `registry.schema.json` | `schemas/registry.schema.json` |
+| `mirror-fields.json` | `schemas/mirror-fields.json` |
+
+`source.json` records the app repository, the app commit
+(`47a4f83d92f102583ac95048856ec00376d55d3c` for this contract), and the
+SHA-256 of each copied file. `tests/test_validation.py` verifies those hashes.
+
+To update the copied contract:
+
+1. In the app checkout, generate the contracts from `schema/contract.json`
+   (`npm run contracts:generate`) at the reviewed commit.
+2. Copy the three files above into `redpen_signing/schemas/`, leaving
+   `registry.config.schema.json` (signer-owned) in place.
+3. Update `redpen_signing/schemas/source.json` with the new full app commit,
+   `files` hashes, and `sourcePaths`.
+4. Run `python tests/run.py`; the pinned-schema tests check the version
+   constants, mirror list, and file hashes.
+
+Do not edit the generated files by hand and do not relax the signer's mirror or
+hash checks to accommodate a registry; change the app contract and regenerate.
+
+## Updating the pin in a registry
+
+Registry workflows execute this repository at the full SHA in
+`registry.config.json` -> `signing.signerCommit`:
+
+1. Merge the reviewed signer change to this repository's `main`; never pin a
+   pull-request or branch SHA.
+2. Copy the resulting full 40-character merge commit from `main`.
+3. In the registry repository, set `signing.signerCommit` to that SHA
+   (canonical JSON, keys sorted) and keep `signing.signerRepository` pointing at
+   `eslam-allam/red-pen-registry-signing`.
+4. Run `python -m redpen_signing.cli check-pin --repo-dir <signer-checkout>
+   --commit <sha> --expected-repository eslam-allam/red-pen-registry-signing`
+   and `validate --skip-release`, then open the registry pull request.
+
 ## Requirements
 
 - Python 3.8 or newer; the signing workflow uses 3.13.
-- `jsonschema` for full schema-6/tree validation (pinned in `requirements.txt`).
+- `jsonschema` for full schema-7/tree validation (pinned in `requirements.txt`).
 - minisign 0.12, either on `PATH` or via `MINISIGN_BIN`.
 - The key must be password-encrypted. `-W` (unencrypted keys) is deliberately
   not used.

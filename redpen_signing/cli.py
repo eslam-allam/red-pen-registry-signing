@@ -350,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     askpass.set_defaults(func=command_write_askpass)
 
     validate = subparsers.add_parser(
-        "validate", help="validate schema 6 and the registry tree"
+        "validate", help="validate schema 7 / API 2 and the registry tree"
     )
     validate.add_argument("--root", default=".")
     validate.add_argument("--registry", default="registry.json")
