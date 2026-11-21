@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -13,10 +13,18 @@ from pathlib import Path
 
 from redpen_signing.canonical import canonical_bytes, sha256_file
 from redpen_signing.keys import read_public_key
-from redpen_signing.registry import REGISTRY_ID, RegistryError, assert_registry_shape
+from redpen_signing.registry import (
+    API_VERSION,
+    MANIFEST_SCHEMA,
+    REGISTRY_ID,
+    SCHEMA,
+    RegistryError,
+)
 from redpen_signing.validate import (
     check_pin,
     ci_config,
+    load_mirror_fields,
+    load_schema,
     validate_registry_tree,
 )
 
@@ -28,18 +36,25 @@ def write_tree(base: Path, *, registry_id: str = "test-registry") -> Path:
     (base / "demo").mkdir(parents=True)
     manifest = {
         "$schema": "../schemas/manifest.schema.json",
-        "schema": 4,
+        "apiVersion": 2,
+        "schema": 5,
         "id": "demo",
         "name": "Demo",
         "version": "1.0.0",
         "description": "Demo adapter",
         "author": "Red Pen tests",
+        "icon": "https://example.invalid/icon.svg",
+        "homepage": "https://example.invalid/demo",
         "extensions": ["txt"],
         "appliesTo": ["file"],
         "output": {"kinds": ["text"]},
         "permissions": [],
+        "registry": [],
         "keyInput": [],
+        "questionInput": [],
         "settings": [],
+        "directories": [],
+        "directoryPicker": {"mode": "r"},
     }
     manifest_path = base / "demo" / "manifest.json"
     manifest_path.write_bytes(canonical_bytes(manifest))
@@ -66,24 +81,33 @@ def write_tree(base: Path, *, registry_id: str = "test-registry") -> Path:
         },
     }
     registry = {
-        "schema": 6,
+        "schema": 7,
         "kind": "red-pen-adapters",
         "registryId": registry_id,
-        "name": "Test registry",
         "publisher": "Red Pen tests",
         "sequence": 1,
         "issuedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "expiresAt": (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "adapters": [
             {
+                "apiVersion": 2,
                 "id": "demo",
                 "name": "Demo",
                 "version": "1.0.0",
                 "description": "Demo adapter",
                 "author": "Red Pen tests",
-                "appliesTo": ["file"],
-                "permissions": [],
+                "icon": "https://example.invalid/icon.svg",
+                "homepage": "https://example.invalid/demo",
                 "extensions": ["txt"],
+                "appliesTo": ["file"],
+                "output": {"kinds": ["text"]},
+                "permissions": [],
+                "registry": [],
+                "keyInput": [],
+                "questionInput": [],
+                "settings": [],
+                "directories": [],
+                "directoryPicker": {"mode": "r"},
                 "folder": "demo",
                 "files": [
                     {"path": "adapter.lua", "sha256": sha256_file(adapter)},
@@ -146,21 +170,76 @@ class ValidationTests(unittest.TestCase):
     def add_managed_runtime(self) -> None:
         def mutate(manifest):
             manifest["settings"] = [
-                {"key": "compiler", "label": "Compiler", "type": "text", "default": "16.2.0"}
+                {
+                    "key": "compiler",
+                    "label": "Compiler",
+                    "type": "text",
+                    "default": "16.2.0",
+                }
             ]
             manifest["runtimes"] = [
                 {"tool": "conda:gcc", "setting": "compiler", "version": "16.2.0"}
             ]
+
         self.update_manifest(mutate)
         registry_path = self.root / "registry.json"
         registry = json.loads(registry_path.read_text())
         manifest = json.loads((self.root / "demo" / "manifest.json").read_text())
+        registry["adapters"][0]["settings"] = manifest["settings"]
         registry["adapters"][0]["runtimes"] = manifest["runtimes"]
         registry_path.write_bytes(canonical_bytes(registry))
+
+    def set_permissions(self, permissions: list[str]) -> None:
+        self.update_manifest(lambda manifest: manifest.update(permissions=permissions))
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0].update(permissions=permissions)
+        )
 
     def test_valid_tree(self) -> None:
         result = validate_registry_tree(self.root)
         self.assertTrue(result["valid"], result["errors"])
+        self.assertEqual(result["adapters"], 1)
+        self.assertEqual(result["registryId"], "test-registry")
+        self.assertEqual(result["sequence"], 1)
+
+    def test_registry_schema_6_rejected(self) -> None:
+        self.mutate_registry(lambda value: value.update(schema=6))
+        errors = self.errors()
+        self.assertTrue(any("schema" in error and "7" in error for error in errors), errors)
+
+    def test_manifest_schema_4_rejected(self) -> None:
+        self.update_manifest(lambda manifest: manifest.update(schema=4))
+        errors = self.errors()
+        self.assertTrue(
+            any("manifest schema must be 5" in error for error in errors), errors
+        )
+
+    def test_entry_api_version_missing_rejected(self) -> None:
+        self.mutate_registry(lambda value: value["adapters"][0].pop("apiVersion"))
+        errors = self.errors()
+        self.assertTrue(any("apiVersion" in error for error in errors), errors)
+
+    def test_entry_api_version_wrong_rejected(self) -> None:
+        self.mutate_registry(
+            lambda value: value["adapters"][0].update(apiVersion=1)
+        )
+        errors = self.errors()
+        self.assertTrue(any("apiVersion" in error for error in errors), errors)
+
+    def test_manifest_api_version_missing_rejected(self) -> None:
+        self.update_manifest(lambda manifest: manifest.pop("apiVersion"))
+        errors = self.errors()
+        self.assertTrue(any("manifest apiVersion" in error for error in errors), errors)
+
+    def test_manifest_api_version_wrong_rejected(self) -> None:
+        self.update_manifest(lambda manifest: manifest.update(apiVersion=1))
+        errors = self.errors()
+        self.assertTrue(any("manifest apiVersion" in error for error in errors), errors)
+
+    def test_root_name_rejected(self) -> None:
+        self.mutate_registry(lambda value: value.update(name="Test registry"))
+        errors = self.errors()
+        self.assertTrue(any("root name" in error for error in errors), errors)
 
     def test_publisher_must_be_string(self) -> None:
         self.mutate_registry(lambda value: value.update(publisher={"name": "x"}))
@@ -171,6 +250,24 @@ class ValidationTests(unittest.TestCase):
             lambda value: value["adapters"][0].update(files=["adapter.lua"])
         )
         self.assertTrue(any("files" in error for error in self.errors()))
+
+    def test_missing_file_hash_rejected(self) -> None:
+        def strip_hashes(value):
+            for declared in value["adapters"][0]["files"]:
+                declared.pop("sha256", None)
+
+        self.mutate_registry(strip_hashes)
+        errors = self.errors()
+        self.assertTrue(any("needs a lowercase sha256" in error for error in errors), errors)
+
+    def test_uppercase_file_hash_rejected(self) -> None:
+        self.mutate_registry(
+            lambda value: value["adapters"][0]["files"][0].update(
+                sha256=value["adapters"][0]["files"][0]["sha256"].upper()
+            )
+        )
+        errors = self.errors()
+        self.assertTrue(any("sha256" in error for error in errors), errors)
 
     def test_unsafe_file_paths_rejected(self) -> None:
         for path in ("../escape", "/etc/passwd", "a:b", "a\\b", "a\x01b"):
@@ -216,11 +313,9 @@ class ValidationTests(unittest.TestCase):
     def test_valid_bootstrap_pins(self) -> None:
         for value in (
             {"mise": "latest"},
-            {"mise": "1.2.3"},
-            {"mise": "v1.2.3"},
-            {"mise": "1.2.3-rc.1+build.1"},
-            {"mise": "v1.2.3-rc.1+build.1"},
-            {"mise": "latest", "uv": "0.5.11"},
+            {"mise": "2026.11.11"},
+            {"mise": "latest", "uv": "0.13.9"},
+            {"mise": "2026.11.11", "uv": "latest"},
         ):
             with self.subTest(value=value), tempfile.TemporaryDirectory(
                 prefix="redpen-bootstrap-test-"
@@ -236,6 +331,7 @@ class ValidationTests(unittest.TestCase):
         for value in (
             {"mise": "any-version"},
             {"mise": "1.2"},
+            {"mise": "2026.11.12"},
             {"uv": True},
             {"mise": "latest", "extra": "1.2.3"},
         ):
@@ -244,6 +340,7 @@ class ValidationTests(unittest.TestCase):
             ) as directory:
                 root = write_tree(Path(directory))
                 self.root = root
+                self.add_managed_runtime()
                 self.set_bootstrap(value)
                 result = validate_registry_tree(root)
                 self.assertFalse(result["valid"], value)
@@ -271,7 +368,9 @@ class ValidationTests(unittest.TestCase):
         self.add_managed_runtime()
 
         # Manifest only.
-        self.update_manifest(lambda manifest: manifest.update({"bootstrap": {"mise": "latest"}}))
+        self.update_manifest(
+            lambda manifest: manifest.update({"bootstrap": {"mise": "latest"}})
+        )
         errors = self.errors()
         self.assertTrue(any("manifest bootstrap" in error for error in errors), errors)
 
@@ -285,24 +384,18 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(any("manifest bootstrap" in error for error in errors), errors)
 
         # Both sides but different values.
-        self.set_bootstrap({"mise": "latest"}, {"mise": "v1.2.3"})
+        self.set_bootstrap({"mise": "latest"}, {"mise": "2026.11.11"})
         errors = self.errors()
         self.assertTrue(any("manifest bootstrap" in error for error in errors), errors)
 
-    def test_invalid_semver_bootstrap_pins(self) -> None:
+    def test_unsupported_bootstrap_pins(self) -> None:
         for value in (
+            "1.2.3",
+            "v1.2.3",
             "01.2.3",
-            "1.02.3",
-            "1.2.03",
-            "1.2",
-            "1.2.3-01",
-            "1.2.3-",
-            "1.2.3+",
-            "1.2.3-rc..1",
-            "1.2.3-rc_1",
-            "1.2.3+meta_1",
-            "1.2.3.4",
+            "1.2.3-rc.1",
             "latest-but-not",
+            "2026.11.10",
         ):
             with self.subTest(version=value), tempfile.TemporaryDirectory(
                 prefix="redpen-bootstrap-test-"
@@ -322,7 +415,7 @@ class ValidationTests(unittest.TestCase):
             any("managed runtimes need" in error for error in result["errors"]),
             result["errors"],
         )
-        self.set_bootstrap({"uv": "0.5.11"})
+        self.set_bootstrap({"uv": "0.13.9"})
         result = validate_registry_tree(self.root)
         self.assertTrue(
             any("managed runtimes need" in error for error in result["errors"]),
@@ -341,9 +434,134 @@ class ValidationTests(unittest.TestCase):
 
     def test_bootstrap_must_match_manifest(self) -> None:
         self.add_managed_runtime()
-        self.set_bootstrap({"mise": "latest"}, {"mise": "v1.2.3"})
+        self.set_bootstrap({"mise": "latest"}, {"mise": "2026.11.11"})
         errors = self.errors()
         self.assertTrue(any("manifest bootstrap" in error for error in errors), errors)
+
+    def test_legacy_permissions_rejected(self) -> None:
+        for permission in (
+            "environment",
+            "files:read",
+            "files:write",
+            "directories",
+        ):
+            with self.subTest(permission=permission), tempfile.TemporaryDirectory(
+                prefix="redpen-permissions-test-"
+            ) as directory:
+                root = write_tree(Path(directory))
+                self.root = root
+                self.set_permissions([permission])
+                errors = validate_registry_tree(root)["errors"]
+                self.assertTrue(
+                    any(
+                        "permissions" in error or permission in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_legacy_environment_field_rejected(self) -> None:
+        self.update_manifest(lambda manifest: manifest.update(environment="PATH"))
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0].update(environment="PATH")
+        )
+        errors = self.errors()
+        self.assertTrue(any("environment" in error for error in errors), errors)
+
+    def test_mirrored_settings_mismatch(self) -> None:
+        self.add_managed_runtime()
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0]["settings"][0].update(
+                label="Different label"
+            )
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any("manifest settings does not match registry" in error for error in errors),
+            errors,
+        )
+
+    def test_mirrored_output_mismatch(self) -> None:
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0]["output"].update(kinds=["diff"])
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any("manifest output does not match registry" in error for error in errors),
+            errors,
+        )
+
+    def test_mirrored_question_input_mismatch(self) -> None:
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0].update(
+                questionInput=[
+                    {"key": "answer", "label": "Answer", "type": "text"}
+                ]
+            )
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any(
+                "manifest questionInput does not match registry" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_mirrored_directories_mismatch(self) -> None:
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0].update(directories=["/tmp/data"])
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any(
+                "manifest directories does not match registry" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_mirrored_directory_picker_mismatch(self) -> None:
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0].update(
+                directoryPicker={"mode": "rw"}
+            )
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any(
+                "manifest directoryPicker does not match registry" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_missing_readme_rejected(self) -> None:
+        (self.root / "demo" / "README.md").unlink()
+        errors = self.errors()
+        self.assertTrue(any("missing README.md" in error for error in errors), errors)
+
+    def test_readme_version_mismatch_rejected(self) -> None:
+        (self.root / "demo" / "README.md").write_text(
+            "# Demo\n\n- **Version:** 9.9.9\n", encoding="utf-8"
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any("README.md version does not match" in error for error in errors),
+            errors,
+        )
+
+    def test_hash_mismatch_rejected(self) -> None:
+        (self.root / "demo" / "adapter.lua").write_text(
+            "app.result({ text = 'changed' })\n", encoding="utf-8"
+        )
+        errors = self.errors()
+        self.assertTrue(any("sha256 mismatch" in error for error in errors), errors)
+
+    def test_manifest_id_mismatch_rejected(self) -> None:
+        self.update_manifest(lambda manifest: manifest.update(id="other"))
+        errors = self.errors()
+        self.assertTrue(any("manifest id does not match" in error for error in errors), errors)
 
     def test_stale_release_requires_pre_signing_skip(self) -> None:
         (self.root / "release.json").write_bytes(
@@ -395,6 +613,42 @@ class ValidationTests(unittest.TestCase):
             ci_config(config)
         config["signing"]["environment"] = "registry-signing-official"
         self.assertEqual(ci_config(config)["environment"], "registry-signing-official")
+
+
+class PinnedSchemaTests(unittest.TestCase):
+    def test_constants_match_v2_contract(self) -> None:
+        self.assertEqual(SCHEMA, 7)
+        self.assertEqual(MANIFEST_SCHEMA, 5)
+        self.assertEqual(API_VERSION, 2)
+        registry_schema = load_schema("registry.schema.json")
+        manifest_schema = load_schema("manifest.schema.json")
+        self.assertEqual(registry_schema["$defs"]["registrySchema"]["const"], 7)
+        self.assertEqual(registry_schema["$defs"]["apiVersion"]["const"], 2)
+        self.assertEqual(manifest_schema["$defs"]["manifestSchema"]["const"], 5)
+        self.assertEqual(manifest_schema["$defs"]["apiVersion"]["const"], 2)
+
+    def test_mirror_fields_are_loaded_from_the_generated_file(self) -> None:
+        fields = load_mirror_fields()
+        self.assertIn("settings", fields)
+        self.assertIn("keyInput", fields)
+        self.assertIn("questionInput", fields)
+        self.assertIn("output", fields)
+        self.assertIn("directories", fields)
+        self.assertIn("directoryPicker", fields)
+        data = json.loads(
+            (ROOT / "redpen_signing" / "schemas" / "mirror-fields.json").read_text()
+        )
+        self.assertEqual(fields, tuple(data["fields"]))
+
+    def test_copied_files_match_source_manifest(self) -> None:
+        schema_dir = ROOT / "redpen_signing" / "schemas"
+        source = json.loads((schema_dir / "source.json").read_text())
+        self.assertEqual(source["appCommit"], "47a4f83d92f102583ac95048856ec00376d55d3c")
+        for name, expected in source["files"].items():
+            with self.subTest(name=name):
+                digest = hashlib.sha256((schema_dir / name).read_bytes()).hexdigest()
+                self.assertEqual(digest, expected)
+                self.assertEqual(source["sourcePaths"][name], f"schemas/{name}")
 
 
 class KeyIdentityTests(unittest.TestCase):

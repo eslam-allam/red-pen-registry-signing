@@ -15,7 +15,9 @@ from .keys import PublicKey
 
 PathLike = Union[str, "os.PathLike[str]"]
 
-SCHEMA = 6
+SCHEMA = 7
+MANIFEST_SCHEMA = 5
+API_VERSION = 2
 KIND = "red-pen-adapters"
 RELEASE_SCHEMA = 1
 RELEASE_KIND = "red-pen-adapters-release"
@@ -134,6 +136,11 @@ def assert_registry_shape(
 ) -> tuple[str, int]:
     if not isinstance(registry, dict):
         raise RegistryError("registry must be a JSON object")
+    if "name" in registry:
+        raise RegistryError(
+            "registry must not contain a root name; adapter names live on "
+            "the entries"
+        )
     if registry.get("schema") != SCHEMA:
         raise RegistryError(f"registry schema must be {SCHEMA}")
     if registry.get("kind") != KIND:
@@ -204,6 +211,10 @@ def assert_registry_shape(
         if entry.get("folder") != adapter_id:
             raise RegistryError(
                 f"adapter {adapter_id!r}: folder must equal id"
+            )
+        if entry.get("apiVersion") != API_VERSION:
+            raise RegistryError(
+                f"adapter {adapter_id!r}: apiVersion must be {API_VERSION}"
             )
         files = entry.get("files")
         if not isinstance(files, list) or not files:
