@@ -190,6 +190,9 @@
           "items": {
             "$ref": "#/$defs/runtime"
           }
+        },
+        "bootstrap": {
+          "$ref": "#/$defs/bootstrap"
         }
       }
     },
@@ -248,6 +251,35 @@
           }
         }
       }
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "uv": {
+          "$ref": "#/$defs/bootstrapPin"
+        },
+        "mise": {
+          "$ref": "#/$defs/bootstrapPin"
+        }
+      },
+      "description": "Bootstrap tool pins. Only 'latest' or a semver pin is allowed."
+    },
+    "bootstrapPin": {
+      "description": "'latest' or a fixed semver pin; arbitrary tool versions are rejected.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "const": "latest"
+        },
+        {
+          "type": "string",
+          "pattern": "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$"
+        }
+      ]
     }
   }
 }
