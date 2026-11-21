@@ -17,6 +17,8 @@ code that sees `MINISIGN_SECRET_KEY_B64` and `MINISIGN_PASSWORD`.
 
 - validates `kind: "red-pen-adapters"`, schema 6, and lowercase slug registry
   ids (official `red-pen-official`, community `red-pen-community`);
+- validates entry-level `bootstrap` pins (`mise`/`uv`): only `latest` or a
+  semver pin is accepted, and the entry must match the manifest;
 - writes deterministic registry bytes (sorted keys, two-space indent, LF, one
   trailing newline);
 - bumps `sequence`, sets `issuedAt` and `expiresAt`;

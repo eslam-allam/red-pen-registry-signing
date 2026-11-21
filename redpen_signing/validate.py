@@ -51,6 +51,7 @@ MIRRORED_FIELDS = (
     "permissions",
     "registry",
     "runtimes",
+    "bootstrap",
 )
 ADAPTER_METADATA_DIRS = {
     ".git",

@@ -115,6 +115,22 @@ class ValidationTests(unittest.TestCase):
         mutate(value)
         path.write_bytes(canonical_bytes(value))
 
+    def set_bootstrap(self, bootstrap, registry_bootstrap=None) -> None:
+        manifest_path = self.root / "demo" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["bootstrap"] = bootstrap
+        manifest_path.write_bytes(canonical_bytes(manifest))
+        registry_path = self.root / "registry.json"
+        registry = json.loads(registry_path.read_text())
+        entry = registry["adapters"][0]
+        entry["bootstrap"] = (
+            bootstrap if registry_bootstrap is None else registry_bootstrap
+        )
+        for declared in entry["files"]:
+            if declared["path"] == "manifest.json":
+                declared["sha256"] = sha256_file(manifest_path)
+        registry_path.write_bytes(canonical_bytes(registry))
+
     def test_valid_tree(self) -> None:
         result = validate_registry_tree(self.root)
         self.assertTrue(result["valid"], result["errors"])
@@ -169,6 +185,47 @@ class ValidationTests(unittest.TestCase):
         path.write_bytes(canonical_bytes(config))
         errors = self.errors()
         self.assertTrue(any("keyFile is missing" in error for error in errors), errors)
+
+    def test_valid_bootstrap_pins(self) -> None:
+        for value in (
+            {"mise": "latest"},
+            {"uv": "0.5.11"},
+            {"mise": "v1.2.3"},
+            {"mise": None},
+        ):
+            with self.subTest(value=value), tempfile.TemporaryDirectory(
+                prefix="redpen-bootstrap-test-"
+            ) as directory:
+                root = write_tree(Path(directory))
+                self.root = root
+                self.set_bootstrap(value)
+                result = validate_registry_tree(root)
+                self.assertTrue(result["valid"], result["errors"])
+
+    def test_malformed_bootstrap_pins(self) -> None:
+        for value in (
+            {"mise": "any-version"},
+            {"mise": "1.2"},
+            {"uv": True},
+            {"mise": "latest", "extra": "1.2.3"},
+        ):
+            with self.subTest(value=value), tempfile.TemporaryDirectory(
+                prefix="redpen-bootstrap-test-"
+            ) as directory:
+                root = write_tree(Path(directory))
+                self.root = root
+                self.set_bootstrap(value)
+                result = validate_registry_tree(root)
+                self.assertFalse(result["valid"], value)
+                self.assertTrue(
+                    any("bootstrap" in error for error in result["errors"]),
+                    result["errors"],
+                )
+
+    def test_bootstrap_must_match_manifest(self) -> None:
+        self.set_bootstrap({"mise": "latest"}, {"uv": "0.5.11"})
+        errors = self.errors()
+        self.assertTrue(any("bootstrap" in error for error in errors), errors)
 
     def test_stale_release_requires_pre_signing_skip(self) -> None:
         (self.root / "release.json").write_bytes(
