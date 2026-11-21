@@ -468,6 +468,41 @@ class ValidationTests(unittest.TestCase):
         errors = self.errors()
         self.assertTrue(any("environment" in error for error in errors), errors)
 
+    def test_mirrored_name_mismatch(self) -> None:
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0].update(name="Different name")
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any("manifest name does not match registry" in error for error in errors),
+            errors,
+        )
+
+    def test_mirrored_permissions_mismatch(self) -> None:
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0].update(permissions=["network"])
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any(
+                "manifest permissions does not match registry" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_mirrored_runtimes_mismatch(self) -> None:
+        self.mutate_registry(
+            lambda registry: registry["adapters"][0].update(
+                runtimes=[{"tool": "conda:gcc"}]
+            )
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any("manifest runtimes does not match registry" in error for error in errors),
+            errors,
+        )
+
     def test_mirrored_settings_mismatch(self) -> None:
         self.add_managed_runtime()
         self.mutate_registry(
@@ -629,25 +664,46 @@ class PinnedSchemaTests(unittest.TestCase):
 
     def test_mirror_fields_are_loaded_from_the_generated_file(self) -> None:
         fields = load_mirror_fields()
-        self.assertIn("settings", fields)
-        self.assertIn("keyInput", fields)
-        self.assertIn("questionInput", fields)
-        self.assertIn("output", fields)
-        self.assertIn("directories", fields)
-        self.assertIn("directoryPicker", fields)
+        expected = (
+            "name",
+            "description",
+            "author",
+            "icon",
+            "homepage",
+            "extensions",
+            "appliesTo",
+            "permissions",
+            "registry",
+            "runtimes",
+            "bootstrap",
+            "settings",
+            "keyInput",
+            "questionInput",
+            "output",
+            "directories",
+            "directoryPicker",
+        )
+        self.assertEqual(fields, expected)
         data = json.loads(
             (ROOT / "redpen_signing" / "schemas" / "mirror-fields.json").read_text()
         )
-        self.assertEqual(fields, tuple(data["fields"]))
+        self.assertEqual(data["fields"], list(expected))
 
     def test_copied_files_match_source_manifest(self) -> None:
         schema_dir = ROOT / "redpen_signing" / "schemas"
         source = json.loads((schema_dir / "source.json").read_text())
+        expected = {
+            "manifest.schema.json",
+            "registry.schema.json",
+            "mirror-fields.json",
+        }
         self.assertEqual(source["appCommit"], "47a4f83d92f102583ac95048856ec00376d55d3c")
-        for name, expected in source["files"].items():
+        self.assertEqual(set(source["files"]), expected)
+        self.assertEqual(set(source["sourcePaths"]), expected)
+        for name in expected:
             with self.subTest(name=name):
                 digest = hashlib.sha256((schema_dir / name).read_bytes()).hexdigest()
-                self.assertEqual(digest, expected)
+                self.assertEqual(digest, source["files"][name])
                 self.assertEqual(source["sourcePaths"][name], f"schemas/{name}")
 
 
