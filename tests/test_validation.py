@@ -252,6 +252,43 @@ class ValidationTests(unittest.TestCase):
                     result["errors"],
                 )
 
+    def test_malformed_bootstrap_shapes(self) -> None:
+        for value in (True, "latest", [], {}, 123, {"mise": ["latest"]}):
+            with self.subTest(value=value), tempfile.TemporaryDirectory(
+                prefix="redpen-bootstrap-shape-"
+            ) as directory:
+                root = write_tree(Path(directory))
+                self.root = root
+                self.set_bootstrap(value)
+                result = validate_registry_tree(root)
+                self.assertFalse(result["valid"], value)
+                self.assertTrue(
+                    any("bootstrap" in error for error in result["errors"]),
+                    result["errors"],
+                )
+
+    def test_bootstrap_mirror_one_side_only(self) -> None:
+        self.add_managed_runtime()
+
+        # Manifest only.
+        self.update_manifest(lambda manifest: manifest.update({"bootstrap": {"mise": "latest"}}))
+        errors = self.errors()
+        self.assertTrue(any("manifest bootstrap" in error for error in errors), errors)
+
+        # Registry only.
+        self.update_manifest(lambda manifest: manifest.pop("bootstrap", None))
+        registry_path = self.root / "registry.json"
+        registry = json.loads(registry_path.read_text())
+        registry["adapters"][0]["bootstrap"] = {"mise": "latest"}
+        registry_path.write_bytes(canonical_bytes(registry))
+        errors = self.errors()
+        self.assertTrue(any("manifest bootstrap" in error for error in errors), errors)
+
+        # Both sides but different values.
+        self.set_bootstrap({"mise": "latest"}, {"mise": "v1.2.3"})
+        errors = self.errors()
+        self.assertTrue(any("manifest bootstrap" in error for error in errors), errors)
+
     def test_invalid_semver_bootstrap_pins(self) -> None:
         for value in (
             "01.2.3",
